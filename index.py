@@ -257,7 +257,7 @@ def aggregate_by(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
             TotalPurchaseDollars=("TotalPurchaseDollars", "sum"),
             TotalSalesQuantity=("TotalSalesQuantity", "sum"),
             TotalSalesDollars=("TotalSalesDollar", "sum"),
-            ProfitMargin=("ProfitMargin", "mean"),
+            GrossProfit=("GrossProfit", "sum"),
         )
         .reset_index()
     )
@@ -291,7 +291,10 @@ def get_vendor_brand_views(df: pd.DataFrame):
         ven["TotalSalesQuantity"] / ven["TotalPurchaseQuantity"],
         0,
     )
+    ven["ProfitMargin"] = (ven["GrossProfit"] / ven["TotalSalesDollars"]) * 100
+
     brand = aggregate_by(df, "Description")
+    brand["ProfitMargin"] = (brand["GrossProfit"] / brand["TotalSalesDollars"]) * 100
     return ven, brand
 
 
@@ -453,7 +456,10 @@ def dashboard_page() -> None:
     col1.metric("Total Sales", f"${format_num(df['TotalSalesDollar'].sum())}")
     col2.metric("Total Purchases", f"${format_num(df['TotalPurchaseDollars'].sum())}")
     col3.metric("Gross Profit", f"${format_num(df['GrossProfit'].sum())}")
-    col4.metric("Profit Margin (%)", f"{df['ProfitMargin'].mean():,.2f}")
+    col4.metric(
+        "Profit Margin (%)",
+        f"{(df['GrossProfit'].sum()/df['TotalSalesDollar'].sum())*100:,.2f}",
+    )
     col5.metric("Unsold Value", f"${format_num(unsold_value)}")
 
     # ---- Vendor purchase contribution ----
@@ -620,7 +626,7 @@ def summary_page() -> None:
     total_sales = df["TotalSalesDollar"].sum()
     total_purchases = df["TotalPurchaseDollars"].sum()
     gross_profit = df["GrossProfit"].sum()
-    avg_margin = df["ProfitMargin"].mean()
+    avg_margin = (df["GrossProfit"].sum() / df["TotalSalesDollar"].sum()) * 100
     unsold_value = (
         (df["TotalPurchaseQuantity"] - df["TotalSalesQuantity"]) * df["PurchasePrice"]
     ).sum()
@@ -650,7 +656,7 @@ def summary_page() -> None:
     st.markdown(
         f"Across **{ven.shape[0]} vendors** and **{brand.shape[0]} brands**, this dataset represents "
         f"**\\${format_num(total_sales)}** in sales against **\\${format_num(total_purchases)}** in purchases — "
-        f"a gross profit of **\\${format_num(gross_profit)}** at an average margin of **{avg_margin:.1f}%**. "
+        f"a gross profit of **\\${format_num(gross_profit)}** at an average margin of **{avg_margin:.2f}%**. "
         f"**\\${format_num(unsold_value)}** of purchased inventory has not yet sold through."
     )
 
