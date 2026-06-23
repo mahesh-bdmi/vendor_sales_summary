@@ -280,6 +280,61 @@ def ensure_report_data() -> None:
     load_report_data.clear()  # bust the cache since the file just changed
 
 
+def render_sidebar_filters(df_all: pd.DataFrame) -> pd.DataFrame:
+    """Render vendor / profit margin / sales filters in the sidebar (shared
+    across both pages) and return the filtered dataframe. Bounds for the
+    sliders are always taken from the full unfiltered data, so they stay
+    stable no matter what's currently selected."""
+    with st.sidebar:
+        st.header("Filters")
+
+        vendor_options = sorted(df_all["VendorName"].unique())
+        selected_vendors = st.multiselect(
+            "Vendor",
+            vendor_options,
+            default=[],
+            key="filter_vendor",
+            help="Leave empty to include all vendors.",
+        )
+
+        margin_lo, margin_hi = float(df_all["ProfitMargin"].min()), float(
+            df_all["ProfitMargin"].max()
+        )
+        margin_range = st.slider(
+            "Profit Margin %",
+            margin_lo,
+            margin_hi,
+            (margin_lo, margin_hi),
+            key="filter_margin",
+        )
+
+        sales_lo, sales_hi = float(df_all["TotalSalesDollar"].min()), float(
+            df_all["TotalSalesDollar"].max()
+        )
+        sales_range = st.slider(
+            "Total Sales $",
+            sales_lo,
+            sales_hi,
+            (sales_lo, sales_hi),
+            format="$%.0f",
+            key="filter_sales",
+        )
+
+        if st.button("Reset filters"):
+            for key in ("filter_vendor", "filter_margin", "filter_sales"):
+                st.session_state.pop(key, None)
+            st.rerun()
+
+    filtered = df_all
+    if selected_vendors:
+        filtered = filtered[filtered["VendorName"].isin(selected_vendors)]
+    filtered = filtered[
+        filtered["ProfitMargin"].between(*margin_range)
+        & filtered["TotalSalesDollar"].between(*sales_range)
+    ]
+    return filtered
+
+
 def get_vendor_brand_views(df: pd.DataFrame):
     """Shared vendor/brand aggregates used by both pages."""
     ven = aggregate_by(df, "VendorName")
@@ -441,8 +496,10 @@ def dashboard_page() -> None:
     theme = get_theme_mode()
     colors = THEME_COLORS[theme]
 
-    ensure_report_data()
-    df = load_report_data()
+    df = st.session_state["filtered_df"]
+    if df.empty:
+        st.warning("No data matches the current filters. Adjust them in the sidebar.")
+        st.stop()
     ven, brand = get_vendor_brand_views(df)
 
     # ---- KPI row ----
@@ -554,8 +611,7 @@ def dashboard_page() -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     # ---- Brands to target: low sales, high margin ----
-    low_sales_threshold = brand["TotalSalesDollars"].quantile(LOW_SALES_QUANTILE)
-    high_margin_threshold = brand["ProfitMargin"].quantile(HIGH_MARGIN_QUANTILE)
+    low_sales_threshold, high_margin_threshold = st.session_state["target_thresholds"]
     brand["TargetBrand"] = np.where(
         (brand["TotalSalesDollars"] < low_sales_threshold)
         & (brand["ProfitMargin"] > high_margin_threshold),
@@ -619,8 +675,10 @@ def summary_page() -> None:
     theme = get_theme_mode()
     colors = THEME_COLORS[theme]
 
-    ensure_report_data()
-    df = load_report_data()
+    df = st.session_state["filtered_df"]
+    if df.empty:
+        st.warning("No data matches the current filters. Adjust them in the sidebar.")
+        st.stop()
     ven, brand = get_vendor_brand_views(df)
 
     total_sales = df["TotalSalesDollar"].sum()
@@ -641,8 +699,7 @@ def summary_page() -> None:
 
     low_turnover = ven.sort_values("StockTurnover", ascending=True).head(10)
 
-    low_sales_threshold = brand["TotalSalesDollars"].quantile(LOW_SALES_QUANTILE)
-    high_margin_threshold = brand["ProfitMargin"].quantile(HIGH_MARGIN_QUANTILE)
+    low_sales_threshold, high_margin_threshold = st.session_state["target_thresholds"]
     brand["TargetBrand"] = np.where(
         (brand["TotalSalesDollars"] < low_sales_threshold)
         & (brand["ProfitMargin"] > high_margin_threshold),
@@ -761,6 +818,21 @@ def summary_page() -> None:
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Vendor Sales Dashboard", layout="wide")
+
+    ensure_report_data()
+    df_all = load_report_data()
+    st.session_state["filtered_df"] = render_sidebar_filters(df_all)
+
+    # Compute the "low sales / high margin" thresholds once from the FULL
+    # (unfiltered) data, so the target-brand classification stays an
+    # absolute cutoff — it shouldn't drift just because the sidebar
+    # filters have narrowed down what's currently on screen.
+    _, brand_all = get_vendor_brand_views(df_all)
+    st.session_state["target_thresholds"] = (
+        brand_all["TotalSalesDollars"].quantile(LOW_SALES_QUANTILE),
+        brand_all["ProfitMargin"].quantile(HIGH_MARGIN_QUANTILE),
+    )
+
     nav = st.navigation(
         [
             st.Page(dashboard_page, title="Dashboard", icon="📊", default=True),
