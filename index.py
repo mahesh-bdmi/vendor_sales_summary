@@ -496,7 +496,8 @@ def dashboard_page() -> None:
     theme = get_theme_mode()
     colors = THEME_COLORS[theme]
 
-    df = st.session_state["filtered_df"]
+    df_all = load_report_data()
+    df = render_sidebar_filters(df_all)
     if df.empty:
         st.warning("No data matches the current filters. Adjust them in the sidebar.")
         st.stop()
@@ -675,10 +676,7 @@ def summary_page() -> None:
     theme = get_theme_mode()
     colors = THEME_COLORS[theme]
 
-    df = st.session_state["filtered_df"]
-    if df.empty:
-        st.warning("No data matches the current filters. Adjust them in the sidebar.")
-        st.stop()
+    df = load_report_data()
     ven, brand = get_vendor_brand_views(df)
 
     total_sales = df["TotalSalesDollar"].sum()
@@ -821,7 +819,6 @@ if __name__ == "__main__":
 
     ensure_report_data()
     df_all = load_report_data()
-    st.session_state["filtered_df"] = render_sidebar_filters(df_all)
 
     # Compute the "low sales / high margin" thresholds once from the FULL
     # (unfiltered) data, so the target-brand classification stays an
