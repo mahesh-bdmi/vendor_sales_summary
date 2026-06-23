@@ -14,6 +14,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import sqlite3
 import streamlit as st
 
@@ -222,6 +224,19 @@ def format_num(x: float) -> str:
     return f"{x:.0f}"
 
 
+def fmt_currency_col(series: pd.Series) -> pd.Series:
+    """e.g. 50123456.0 -> '$50.12M' — for display tables, not raw exports."""
+    return series.map(lambda v: f"${format_num(v)}")
+
+
+def fmt_pct_col(series: pd.Series, decimals: int = 1) -> pd.Series:
+    return series.map(lambda v: f"{v:.{decimals}f}%")
+
+
+def fmt_ratio_col(series: pd.Series, decimals: int = 2) -> pd.Series:
+    return series.map(lambda v: f"{v:.{decimals}f}")
+
+
 @st.cache_data
 def load_report_data() -> pd.DataFrame:
     df = pd.read_csv(REPORT_CSV)
@@ -249,25 +264,24 @@ def aggregate_by(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     return agg
 
 
-def build_report() -> None:
-    st.set_page_config(page_title="Vendor Sales Dashboard", layout="wide")
-    st.title("VENDOR SALES DASHBOARD")
+def ensure_report_data() -> None:
+    """Make sure report_ready_data.csv exists, rebuilding it from the
+    database if needed. Shared by every page so the rebuild only happens
+    once, no matter which page the user lands on first."""
+    if REPORT_CSV.exists():
+        return
+    st.warning("Report data not found — building it now from the database.")
+    if not SUMMARY_CSV.exists():
+        if not DB_PATH.exists():
+            st.error(f"Database not found at '{DB_PATH}'. Cannot build the report.")
+            st.stop()
+        summary_table_export()
+    process_csv()
+    load_report_data.clear()  # bust the cache since the file just changed
 
-    theme = get_theme_mode()
-    colors = THEME_COLORS[theme]
 
-    if not REPORT_CSV.exists():
-        st.warning("Report data not found — building it now from the database.")
-        if not SUMMARY_CSV.exists():
-            if not DB_PATH.exists():
-                st.error(f"Database not found at '{DB_PATH}'. Cannot build the report.")
-                st.stop()
-            summary_table_export()
-        process_csv()
-        load_report_data.clear()  # bust the cache since the file just changed
-
-    df = load_report_data()
-
+def get_vendor_brand_views(df: pd.DataFrame):
+    """Shared vendor/brand aggregates used by both pages."""
     ven = aggregate_by(df, "VendorName")
     ven["purchase_contribution"] = (
         ven["TotalPurchaseDollars"] / ven["TotalPurchaseDollars"].sum()
@@ -277,8 +291,156 @@ def build_report() -> None:
         ven["TotalSalesQuantity"] / ven["TotalPurchaseQuantity"],
         0,
     )
-
     brand = aggregate_by(df, "Description")
+    return ven, brand
+
+
+def build_pareto_chart(top10: pd.DataFrame, grand_total: float, colors: dict):
+    """Bar chart of purchase $ per vendor with a cumulative-% line on a
+    secondary axis — the classic Pareto chart for the 80/20 view."""
+    cum_pct = top10["TotalPurchaseDollars"].cumsum() / grand_total * 100
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=top10["VendorName"],
+            y=top10["TotalPurchaseDollars"],
+            name="Purchase $",
+            marker_color=PIE_PALETTE[0],
+            marker_line_width=0,
+            text=[f"${v:,.0f}" for v in top10["TotalPurchaseDollars"]],
+            textposition="outside",
+            hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=top10["VendorName"],
+            y=cum_pct,
+            name="Cumulative %",
+            mode="lines+markers",
+            line=dict(color=TARGET_YES_COLOR, width=2),
+            marker=dict(size=7, color=TARGET_YES_COLOR),
+            hovertemplate="<b>%{x}</b><br>Cumulative: %{y:.1f}%<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_hline(
+        y=80,
+        line_dash="dot",
+        line_color=colors["threshold_color"],
+        annotation_text="80%",
+        annotation_font_size=10,
+        annotation_font_color=colors["muted_text"],
+        secondary_y=True,
+    )
+    fig.update_layout(
+        title="<b>Pareto Chart — Top 10 Vendors by Purchase $</b>", bargap=0.25
+    )
+    fig.update_xaxes(tickangle=-30)
+    fig.update_yaxes(title_text="Purchase $", secondary_y=False)
+    fig.update_yaxes(
+        title_text="Cumulative %", secondary_y=True, range=[0, 110], ticksuffix="%"
+    )
+    return fig
+
+
+def build_turnover_chart(low_turnover_df: pd.DataFrame, colors: dict):
+    """Horizontal bar chart of the lowest-turnover vendors. Shared by the
+    Dashboard and Analysis Summary pages so they stay visually consistent."""
+    fig = px.bar(
+        low_turnover_df.sort_values("StockTurnover", ascending=True),
+        y="VendorName",
+        x="StockTurnover",
+        orientation="h",
+        title=f"<b>Vendors with Low Turnover</b><br><span style='font-size:11px;color:{colors['muted_text']}'>Darker = bigger risk</span>",
+        color="StockTurnover",
+        color_continuous_scale=px.colors.sequential.Reds_r,
+    )
+    fig.update_layout(xaxis_title=None, yaxis_title=None, coloraxis_showscale=False)
+    fig.update_traces(
+        texttemplate="%{x:.2f}",
+        textposition="outside",
+        marker_line_width=0,
+        cliponaxis=False,
+        hovertemplate="<b>%{y}</b><br>Turnover: %{x:.2f}<extra></extra>",
+    )
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def build_margin_chart(brands_df: pd.DataFrame, colors: dict):
+    """Horizontal bar chart of profit margin for a small set of brands —
+    used for the hidden-gem (low sales, high margin) table on the summary page."""
+    fig = px.bar(
+        brands_df.sort_values("ProfitMargin", ascending=False),
+        y="Description",
+        x="ProfitMargin",
+        orientation="h",
+        title=f"<b>Profit Margin</b><br><span style='font-size:11px;color:{colors['muted_text']}'>Hidden-gem brands</span>",
+        color="ProfitMargin",
+        color_continuous_scale=px.colors.sequential.Purples,
+    )
+    fig.update_layout(xaxis_title=None, yaxis_title=None, coloraxis_showscale=False)
+    fig.update_traces(
+        texttemplate="%{x:.1f}%",
+        textposition="outside",
+        marker_line_width=0,
+        cliponaxis=False,
+        hovertemplate="<b>%{y}</b><br>Margin: %{x:.1f}%<extra></extra>",
+    )
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def render_table(df: pd.DataFrame, colors: dict) -> None:
+    """Render a DataFrame as a static HTML table that's centered, sized to
+    its content (not stretched full-width like st.dataframe), and themed
+    to match the current light/dark mode."""
+    styled = df.style.hide(axis="index").set_table_styles(
+        [
+            {
+                "selector": "table",
+                "props": [
+                    ("border-collapse", "collapse"),
+                    ("margin", "0 auto"),
+                    ("width", "auto"),
+                ],
+            },
+            {
+                "selector": "th",
+                "props": [
+                    ("text-align", "center"),
+                    ("padding", "6px 18px"),
+                    ("background-color", colors["hover_bg"]),
+                    ("color", colors["font_color"]),
+                    ("border", f"1px solid {colors['grid_color']}"),
+                ],
+            },
+            {
+                "selector": "td",
+                "props": [
+                    ("text-align", "center"),
+                    ("padding", "6px 18px"),
+                    ("color", colors["font_color"]),
+                    ("border", f"1px solid {colors['grid_color']}"),
+                ],
+            },
+        ]
+    )
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
+
+
+def dashboard_page() -> None:
+    st.title("VENDOR SALES DASHBOARD")
+
+    theme = get_theme_mode()
+    colors = THEME_COLORS[theme]
+
+    ensure_report_data()
+    df = load_report_data()
+    ven, brand = get_vendor_brand_views(df)
 
     # ---- KPI row ----
     col1, col2, col3, col4, col5 = st.columns(
@@ -375,26 +537,9 @@ def build_report() -> None:
     fig_bar_brand.update_yaxes(autorange="reversed")
     style_fig(fig_bar_brand, colors, height=420)
 
-    fig_turnover = px.bar(
-        ven.sort_values("StockTurnover", ascending=True).head(10),
-        y="VendorName",
-        x="StockTurnover",
-        orientation="h",
-        title=f"<b>Vendors with Low Turnover</b><br><span style='font-size:11px;color:{colors['muted_text']}'>Darker = bigger risk</span>",
-        color="StockTurnover",
-        color_continuous_scale=px.colors.sequential.Reds_r,
+    fig_turnover = build_turnover_chart(
+        ven.sort_values("StockTurnover", ascending=True).head(10), colors
     )
-    fig_turnover.update_layout(
-        xaxis_title=None, yaxis_title=None, coloraxis_showscale=False
-    )
-    fig_turnover.update_traces(
-        texttemplate="%{x:.2f}",
-        textposition="outside",
-        marker_line_width=0,
-        cliponaxis=False,
-        hovertemplate="<b>%{y}</b><br>Turnover: %{x:.2f}<extra></extra>",
-    )
-    fig_turnover.update_yaxes(autorange="reversed")
     style_fig(fig_turnover, colors, height=420)
 
     col11, col12, col13 = st.columns(3)
@@ -458,5 +603,162 @@ def build_report() -> None:
         st.plotly_chart(target_brand_chart, use_container_width=True)
 
 
+# ---------------------------------------------------------------------------
+# Page 2: Written summary of the analysis (computed live from the data,
+# so it never goes stale relative to whatever's in report_ready_data.csv)
+# ---------------------------------------------------------------------------
+def summary_page() -> None:
+    st.title("VENDOR ANALYSIS SUMMARY")
+
+    theme = get_theme_mode()
+    colors = THEME_COLORS[theme]
+
+    ensure_report_data()
+    df = load_report_data()
+    ven, brand = get_vendor_brand_views(df)
+
+    total_sales = df["TotalSalesDollar"].sum()
+    total_purchases = df["TotalPurchaseDollars"].sum()
+    gross_profit = df["GrossProfit"].sum()
+    avg_margin = df["ProfitMargin"].mean()
+    unsold_value = (
+        (df["TotalPurchaseQuantity"] - df["TotalSalesQuantity"]) * df["PurchasePrice"]
+    ).sum()
+
+    top10 = ven.sort_values("TotalPurchaseDollars", ascending=False).head(10)
+    top10_pct = (
+        top10["TotalPurchaseDollars"].sum() / ven["TotalPurchaseDollars"].sum() * 100
+    )
+    top_vendor = top10.iloc[0]
+
+    top_brand = brand.sort_values("TotalSalesDollars", ascending=False).iloc[0]
+
+    low_turnover = ven.sort_values("StockTurnover", ascending=True).head(10)
+
+    low_sales_threshold = brand["TotalSalesDollars"].quantile(LOW_SALES_QUANTILE)
+    high_margin_threshold = brand["ProfitMargin"].quantile(HIGH_MARGIN_QUANTILE)
+    brand["TargetBrand"] = np.where(
+        (brand["TotalSalesDollars"] < low_sales_threshold)
+        & (brand["ProfitMargin"] > high_margin_threshold),
+        "Yes",
+        "No",
+    )
+    target_brands = brand[brand["TargetBrand"] == "Yes"].sort_values(
+        "ProfitMargin", ascending=False
+    )
+
+    st.markdown(
+        f"Across **{ven.shape[0]} vendors** and **{brand.shape[0]} brands**, this dataset represents "
+        f"**\\${format_num(total_sales)}** in sales against **\\${format_num(total_purchases)}** in purchases — "
+        f"a gross profit of **\\${format_num(gross_profit)}** at an average margin of **{avg_margin:.1f}%**. "
+        f"**\\${format_num(unsold_value)}** of purchased inventory has not yet sold through."
+    )
+
+    st.divider()
+
+    st.subheader("1. Vendor spend is highly concentrated")
+    st.markdown(
+        f"The top 10 vendors account for **{top10_pct:.1f}%** of all purchase dollars — a classic Pareto "
+        f"distribution. **{top_vendor['VendorName']}** alone drives **{top_vendor['purchase_contribution']}** "
+        f"of purchases (\\${format_num(top_vendor['TotalPurchaseDollars'])}). This concentration is useful "
+        f"leverage in vendor negotiations, but also represents supply-chain risk if a top vendor is disrupted."
+    )
+    pareto_fig = build_pareto_chart(top10, ven["TotalPurchaseDollars"].sum(), colors)
+    style_fig(pareto_fig, colors, height=440, show_legend=True)
+
+    top10_display = top10[
+        ["VendorName", "TotalPurchaseDollars", "purchase_contribution"]
+    ].copy()
+    top10_display["TotalPurchaseDollars"] = fmt_currency_col(
+        top10_display["TotalPurchaseDollars"]
+    )
+    top10_display = top10_display.rename(
+        columns={
+            "TotalPurchaseDollars": "Purchase $",
+            "purchase_contribution": "% of Total",
+        }
+    )
+
+    chart_col, table_col = st.columns([3, 2])
+    with chart_col, st.container(border=True):
+        st.plotly_chart(pareto_fig, use_container_width=True)
+    with table_col, st.container(border=True):
+        render_table(top10_display, colors)
+
+    st.subheader("2. Revenue is led by a small set of flagship brands")
+    st.markdown(
+        f"**{top_brand['Description']}** is the top-selling brand at **\\${format_num(top_brand['TotalSalesDollars'])}** "
+        "in revenue. Brand-level revenue leaders tend to mirror the vendor rankings above — the largest "
+        "vendors are largely winning on the back of a handful of marquee products."
+    )
+
+    st.subheader("3. A long tail of vendors shows weak inventory turnover")
+    st.markdown(
+        "These vendors are selling through the smallest share of what they purchase — capital and shelf "
+        "space tied up with the least to show for it:"
+    )
+    turnover_fig = build_turnover_chart(low_turnover, colors)
+    style_fig(turnover_fig, colors, height=420)
+
+    low_turnover_display = low_turnover[
+        ["VendorName", "StockTurnover", "TotalPurchaseDollars"]
+    ].copy()
+    low_turnover_display["StockTurnover"] = fmt_ratio_col(
+        low_turnover_display["StockTurnover"]
+    )
+    low_turnover_display["TotalPurchaseDollars"] = fmt_currency_col(
+        low_turnover_display["TotalPurchaseDollars"]
+    )
+    low_turnover_display = low_turnover_display.rename(
+        columns={
+            "StockTurnover": "Turnover Ratio",
+            "TotalPurchaseDollars": "Purchase $",
+        }
+    )
+
+    chart_col, table_col = st.columns([3, 2])
+    with chart_col, st.container(border=True):
+        st.plotly_chart(turnover_fig, use_container_width=True)
+    with table_col, st.container(border=True):
+        render_table(low_turnover_display, colors)
+
+    st.subheader("4. Hidden-gem brands: low visibility, high margin")
+    st.markdown(
+        f"**{len(target_brands)} brands** have low total sales but profit margins above the "
+        f"{HIGH_MARGIN_QUANTILE:.0%} threshold ({high_margin_threshold:.1f}%+) — strong candidates for a "
+        "marketing push or better shelf placement, since the margin is already proven and the bottleneck "
+        "is simply volume."
+    )
+    target_brands_top15 = target_brands.head(15)
+    margin_fig = build_margin_chart(target_brands_top15, colors)
+    style_fig(margin_fig, colors, height=440)
+
+    target_brands_display = target_brands_top15[
+        ["Description", "TotalSalesDollars", "ProfitMargin"]
+    ].copy()
+    target_brands_display["TotalSalesDollars"] = fmt_currency_col(
+        target_brands_display["TotalSalesDollars"]
+    )
+    target_brands_display["ProfitMargin"] = fmt_pct_col(
+        target_brands_display["ProfitMargin"]
+    )
+    target_brands_display = target_brands_display.rename(
+        columns={"TotalSalesDollars": "Sales $", "ProfitMargin": "Margin %"}
+    )
+
+    chart_col, table_col = st.columns([3, 2])
+    with chart_col, st.container(border=True):
+        st.plotly_chart(margin_fig, use_container_width=True)
+    with table_col, st.container(border=True):
+        render_table(target_brands_display, colors)
+
+
 if __name__ == "__main__":
-    build_report()
+    st.set_page_config(page_title="Vendor Sales Dashboard", layout="wide")
+    nav = st.navigation(
+        [
+            st.Page(dashboard_page, title="Dashboard", icon="📊", default=True),
+            st.Page(summary_page, title="Analysis Summary", icon="📝"),
+        ]
+    )
+    nav.run()
